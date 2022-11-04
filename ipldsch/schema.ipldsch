@@ -1,0 +1,17 @@
+type Message struct {
+	entries [Entry]
+	next optional Link
+}
+
+type Entry struct {
+	block Link
+	startIndexInBlock optional Int
+	length Int
+	startIndexInMsg Int
+	MDIV Bytes
+}
+
+type Send struct {
+	multihash Bytes
+	resumeFromEntry optional Link
+}
