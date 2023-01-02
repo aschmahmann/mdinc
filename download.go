@@ -3,6 +3,7 @@ package mdinc
 import (
 	"context"
 	"fmt"
+	"github.com/aschmahmann/mdinc/routing"
 	"sync"
 	"time"
 
@@ -12,7 +13,6 @@ import (
 	"github.com/libp2p/go-libp2p/core/peer"
 
 	"github.com/ipfs/go-cid"
-	"github.com/multiformats/go-multiaddr"
 	"github.com/multiformats/go-multicodec"
 	"github.com/multiformats/go-multihash"
 
@@ -23,7 +23,8 @@ import (
 	bsclient "github.com/ipfs/go-bitswap/client"
 	"github.com/ipfs/go-bitswap/client/sessioniface"
 
-	drp "github.com/ipfs/go-delegated-routing/gen/proto"
+	drc "github.com/ipfs/go-libipfs/routing/http/client"
+	drt "github.com/ipfs/go-libipfs/routing/http/types"
 )
 
 const blockLimit = 1 << 21 // 2MiB
@@ -34,12 +35,12 @@ func DownloadWithDiscovery(ctx context.Context, mh multihash.Multihash, routerUr
 	initialLookupCtx, initialLookupCancel := context.WithTimeout(ctx, time.Second*1)
 	defer initialLookupCancel()
 
-	drpclient, err := drp.New_DelegatedRouting_Client(routerUrl)
+	drpclient, err := drc.New(routerUrl)
 	if err != nil {
 		return nil, err
 	}
 
-	fprovsresp, err := drpclient.FindProviders(initialLookupCtx, &drp.FindProvidersRequest{Key: drp.LinkToAny(cid.NewCidV1(uint64(multicodec.Raw), mh))})
+	fprovsresp, err := drpclient.FindProviders(initialLookupCtx, cid.NewCidV1(uint64(multicodec.Raw), mh))
 	initialLookupCancel()
 	if err != nil && len(fprovsresp) == 0 {
 		return nil, err
@@ -48,24 +49,24 @@ func DownloadWithDiscovery(ctx context.Context, mh multihash.Multihash, routerUr
 	var proofs []cid.Cid
 	var peers []peer.AddrInfo
 	for _, r := range fprovsresp {
-		for _, p := range r.Providers {
-			n := p.ProviderNode
-			if n.Proof != nil && n.Proof.MD != nil {
-				proofs = append(proofs, cid.Cid(*n.Proof.MD))
+		switch pr := r.(type) {
+		case *drt.ReadBitswapProviderRecord:
+			ai := peer.AddrInfo{
+				ID:    *pr.ID,
+				Addrs: nil,
 			}
-			if n.Peer != nil {
-				ai := peer.AddrInfo{
-					ID:    peer.ID(n.Peer.ID),
-					Addrs: nil,
-				}
-				for _, a := range n.Peer.Multiaddresses {
-					ma, err := multiaddr.NewMultiaddrBytes(a)
-					if err == nil {
-						ai.Addrs = append(ai.Addrs, ma)
-					}
-				}
-				peers = append(peers, ai)
+			for _, a := range pr.Addrs {
+				ai.Addrs = append(ai.Addrs, a.Multiaddr)
 			}
+			peers = append(peers, ai)
+		case *drt.UnknownProviderRecord:
+			// TODO: check protocol name, figure out deal with schema name
+			c, err := routing.GetSHA256ProofFromProviderRecord(pr.Bytes)
+			if err != nil {
+				logger.Infof("could not decode provider record: %q", err.Error())
+				continue
+			}
+			proofs = append(proofs, c)
 		}
 	}
 

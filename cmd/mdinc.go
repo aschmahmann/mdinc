@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/aschmahmann/mdinc/routing"
 	"io"
 	"log"
 	"os"
@@ -287,6 +288,44 @@ func main() {
 						return err
 					}
 
+					return nil
+				},
+			},
+			{
+				Name:        "create-advertisement",
+				Usage:       "<proofCID>",
+				Description: "Create an advertisement containing the proof. Only for SHA256 advertisements. Format is experimental.",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:  "multibase-encoding",
+						Usage: "encode the advertisement in multibase (using a name like `base16` or a prefix like `f`)",
+					},
+				},
+				Action: func(ctx *cli.Context) error {
+					if ctx.NArg() != 1 {
+						return errors.New("invalid number of arguments")
+					}
+					cidStr := ctx.Args().Get(0)
+
+					c, err := cid.Decode(cidStr)
+					if err != nil {
+						return err
+					}
+
+					ad, err := routing.CreateSHA256ProofProviderRecord(c)
+					if err != nil {
+						return err
+					}
+					if ctx.IsSet("multibase-encoding") {
+						encStr := ctx.String("multibase-encoding")
+						enc, err := multibase.EncoderByName(encStr)
+						if err != nil {
+							return err
+						}
+						fmt.Println(enc.Encode(ad))
+					} else {
+						fmt.Printf(string(ad))
+					}
 					return nil
 				},
 			},
