@@ -16,7 +16,15 @@ type Entry struct {
 	StartIndexInMsg   uint64
 	MDIV              []byte
 }
+
 type Send struct {
 	Multihash       []byte
 	ResumeFromEntry *cid.Cid
+}
+
+type OutboardMetadata struct {
+	Version   uint
+	Root      cid.Cid
+	ChunkSize uint
+	TotalSize uint64
 }

@@ -7,16 +7,15 @@ import (
 	"encoding"
 	"encoding/binary"
 	"fmt"
+	"golang.org/x/sync/errgroup"
 	"hash"
 	"io"
 
-	"golang.org/x/sync/errgroup"
-
-	"github.com/ipfs/go-bitswap/client/sessioniface"
 	blocks "github.com/ipfs/go-block-format"
 	"github.com/ipfs/go-cid"
 	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"github.com/ipfs/go-log/v2"
+	"github.com/ipld/go-car"
 	"github.com/ipld/go-ipld-prime"
 	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/datamodel"
@@ -31,9 +30,244 @@ import (
 
 var logger = log.Logger("mdinc/verify")
 
+type addRemoveCid struct {
+	key cid.Cid
+	add bool
+}
+
+func (a addRemoveCid) IsAdd() bool {
+	return a.add
+}
+
+func (a addRemoveCid) Key() cid.Cid {
+	return a.key
+}
+
+type AddRemoveCid interface {
+	IsAdd() bool
+	Key() cid.Cid
+}
+
+const MaxChunkSize = 1 << 20
+
+func VerifyOutboard(mh multihash.Multihash, input io.ReaderAt, outboard io.Reader) (bool, error) {
+	dmh, err := multihash.Decode(mh)
+	if err != nil {
+		return false, err
+	}
+	if dmh.Code != uint64(multicodec.Sha2_256) || dmh.Length != 32 {
+		return false, fmt.Errorf("only SHA2-256-256 supported not %v", dmh)
+	}
+
+	hasher := sha256.New().(marshallableHasher)
+	expectedDigest := dmh.Digest
+
+	nb := ipldsch.Prototypes.OutboardMetadata.NewBuilder()
+	mdInput := io.NewSectionReader(input, 0, 1<<63-1)
+	if err := dagcbor.Decode(nb, mdInput); err != nil {
+		return false, err
+	}
+	bnd := bindnode.Unwrap(nb.Build())
+	meta, ok := bnd.(*ipldsch.OutboardMetadata)
+	if !ok {
+		return false, fmt.Errorf("could not decode outboard metadata")
+	}
+
+	if meta.Version != 1 {
+		return false, fmt.Errorf("only version 1 of outboard mdinc is supported, got version %d", meta.Version)
+	}
+	if meta.TotalSize <= uint64(meta.ChunkSize) {
+		return false, fmt.Errorf("expected the total block size to be larger than the chunk size")
+	}
+	if meta.Root.Equals(cid.Undef) || bytes.Equal(meta.Root.Hash(), mh) {
+		return false, fmt.Errorf("expected the meta data root hash to match the input hash")
+	}
+	if meta.ChunkSize != uint(BlockSize) {
+		return false, fmt.Errorf("for now the only supported chunk size is %d, got %d", BlockSize, meta.ChunkSize)
+	}
+
+	ivBuf := make([]byte, 32)
+	chunkBuf := make([]byte, meta.ChunkSize)
+
+	remainingSize := meta.TotalSize - uint64(meta.ChunkSize)
+	isFirstProcessedChunk := true
+	for remainingSize > 0 {
+		// TODO: Is this safe for all readers?
+		if _, err := io.ReadFull(outboard, ivBuf[:]); err != nil {
+			return false, err
+		}
+
+		// TODO: Handle the one of the chunks not being the fixed size
+		if err := decodeSHA256Hasher(hasher, ivBuf, meta.TotalSize-uint64(meta.ChunkSize)); err != nil {
+			return false, err
+		}
+
+		if _, err := input.ReadAt(chunkBuf, int64(meta.TotalSize-uint64(meta.ChunkSize))); err != nil {
+			return false, err
+		}
+		if _, err := hasher.Write(chunkBuf); err != nil {
+			return false, err
+		}
+
+		if isFirstProcessedChunk {
+			// Treat the last chunk of the blob specially since there's a finalization step in the hasher
+			calculatedDigest := hasher.Sum(nil)
+			if !bytes.Equal(expectedDigest, calculatedDigest) {
+				return false, fmt.Errorf("expected digest %x, got %x", expectedDigest, calculatedDigest)
+			}
+			isFirstProcessedChunk = false
+		} else {
+			out, err := hasher.MarshalBinary()
+			if err != nil {
+				return false, err
+			}
+			calculatedPartialDigest := GetSHA256IVFromMarshalledOutput(out)
+			if !bytes.Equal(expectedDigest, calculatedPartialDigest) {
+				return false, fmt.Errorf("expected partial digest %x, got %x", expectedDigest, calculatedPartialDigest)
+			}
+		}
+		expectedDigest = ivBuf[:]
+
+		if remainingSize <= uint64(meta.ChunkSize) {
+			remainingSize = 0
+		} else {
+			remainingSize -= uint64(meta.ChunkSize)
+		}
+	}
+
+	if initDigest, msgInitDigest := GetSHA256InitialIV(), expectedDigest; !bytes.Equal(initDigest, msgInitDigest) {
+		return false, fmt.Errorf("expected initial digest %x, got %x", expectedDigest, msgInitDigest)
+	}
+
+	return true, nil
+}
+
+func VerifyOutboardDAG(mh multihash.Multihash, input io.ReaderAt, outboard io.Reader) (bool, error) {
+	dmh, err := multihash.Decode(mh)
+	if err != nil {
+		return false, err
+	}
+	if dmh.Code != uint64(multicodec.Sha2_256) || dmh.Length != 32 {
+		return false, fmt.Errorf("only SHA2-256-256 supported not %v", dmh)
+	}
+
+	hasher := sha256.New().(marshallableHasher)
+	expectedDigest := dmh.Digest
+	isFirstMessageEntry := true
+
+	cr, err := car.NewCarReader(outboard)
+	if err != nil {
+		return false, err
+	}
+
+	if cr.Header == nil || len(cr.Header.Roots) != 1 {
+		return false, fmt.Errorf("expected a single root CAR")
+	}
+
+	var latestMessage *ipldsch.Message
+	var nextProofLink *cid.Cid = &cr.Header.Roots[0]
+
+	bytesRead := uint64(0)
+	for nextProofLink != nil {
+		blk, err := cr.Next()
+		if err != nil {
+			return false, err
+		}
+		if !blk.Cid().Equals(*nextProofLink) {
+			return false, fmt.Errorf("proof blocks not ordered correctly")
+		}
+
+		nb := ipldsch.Prototypes.Message.NewBuilder()
+		if err := dagcbor.Decode(nb, bytes.NewReader(blk.RawData())); err != nil {
+			return false, err
+		}
+		nd := nb.Build()
+		bnd := bindnode.Unwrap(nd)
+
+		var ok bool
+		latestMessage, ok = bnd.(*ipldsch.Message)
+		if !ok {
+			return false, fmt.Errorf("could not decode block as proof message")
+		}
+
+		for i, e := range latestMessage.Entries {
+			bl := e.Block
+			if bl.Type() != uint64(multicodec.Raw) {
+				return false, fmt.Errorf("blocks must be raw")
+			}
+
+			if e.StartIndexInBlock != nil && *e.StartIndexInBlock != 0 {
+				return false, fmt.Errorf("entry must start from the start of the block")
+			}
+
+			if e.Length > MaxChunkSize {
+				return false, fmt.Errorf("chunk size greater than what we're willing to verify. Max %d bytes, asked for %d", MaxChunkSize, e.Length)
+			}
+
+			if e.StartIndexInMsg != bytesRead {
+				return false, fmt.Errorf("entry must start from where the last chunk left off")
+			}
+
+			blockData := make([]byte, e.Length)
+			_, err := input.ReadAt(blockData, int64(bytesRead))
+			if err != nil {
+				return false, fmt.Errorf("could not read chunk: %w", err)
+			}
+
+			startIndexInBlock := 0
+			if e.StartIndexInBlock != nil {
+				startIndexInBlock = *e.StartIndexInBlock
+			}
+
+			if err := decodeSHA256Hasher(hasher, e.MDIV, e.StartIndexInMsg); err != nil {
+				return err
+			}
+
+			if _, err := hasher.Write(blockData[startIndexInBlock : startIndexInBlock+e.Length]); err != nil {
+				return err
+			}
+
+			if i == 0 && isFirstMessageEntry {
+				calculatedDigest := hasher.Sum(nil)
+				if !bytes.Equal(expectedDigest, calculatedDigest) {
+					return fmt.Errorf("expected digest %x, got %x", expectedDigest, calculatedDigest)
+				}
+				expectedDigest = e.MDIV
+				isFirstMessageEntry = false
+			} else {
+				out, err := hasher.MarshalBinary()
+				if err != nil {
+					return err
+				}
+				calculatedPartialDigest := GetSHA256IVFromMarshalledOutput(out)
+				if !bytes.Equal(expectedDigest, calculatedPartialDigest) {
+					return fmt.Errorf("expected partial digest %x, got %x", expectedDigest, calculatedPartialDigest)
+				}
+				expectedDigest = e.MDIV
+			}
+		}
+
+		nextProofLink = latestMessage.Next
+	}
+
+	earliestEntry := latestMessage.Entries[len(latestMessage.Entries)-1]
+	if initDigest, msgInitDigest := GetSHA256InitialIV(), earliestEntry.MDIV; !bytes.Equal(initDigest, msgInitDigest) {
+		return fmt.Errorf("expected initial digest %x, got %x", expectedDigest, msgInitDigest)
+	}
+	if earliestEntry.StartIndexInMsg != 0 {
+		return fmt.Errorf("expected earliest entry to start at the beginning of the message instead it started at %d bytes in", earliestEntry.StartIndexInMsg)
+	}
+
+	return nil
+}
+
 // Verify validates that the proof matches the given multihash.
 // Implementation note: It walks the proof linearly which minimizes exposure to fraudulent proofs.
 func Verify(mh multihash.Multihash, proof cid.Cid, lsys ipld.LinkSystem) error {
+	return Verify2(mh, proof, lsys, nil)
+}
+
+func Verify2(mh multihash.Multihash, proof cid.Cid, lsys ipld.LinkSystem, inputData io.ReaderAt) error {
 	dmh, err := multihash.Decode(mh)
 	if err != nil {
 		return err
@@ -117,7 +351,7 @@ func Verify(mh multihash.Multihash, proof cid.Cid, lsys ipld.LinkSystem) error {
 
 type Loader interface {
 	GetBlock(context.Context, cid.Cid) (blocks.Block, error)
-	GetBlocksCh(ctx context.Context, keys <-chan sessioniface.AddRemoveCid) (<-chan blocks.Block, error)
+	GetBlocksCh(ctx context.Context, keys <-chan AddRemoveCid) (<-chan blocks.Block, error)
 }
 
 type BlockLoader struct {
@@ -155,7 +389,7 @@ func (b *BlockLoader) GetBlock(ctx context.Context, c cid.Cid) (blocks.Block, er
 	return blk, nil
 }
 
-func (b *BlockLoader) GetBlocksCh(ctx context.Context, keys <-chan sessioniface.AddRemoveCid) (<-chan blocks.Block, error) {
+func (b *BlockLoader) GetBlocksCh(ctx context.Context, keys <-chan AddRemoveCid) (<-chan blocks.Block, error) {
 	eg, gctx := errgroup.WithContext(ctx)
 	receivedBlockCh := make(chan blocks.Block)
 	for i := 0; i < b.nworkers; i++ {
@@ -224,7 +458,7 @@ func SpeedyVerify(ctx context.Context, mh multihash.Multihash, proof cid.Cid, ls
 
 	tmpExpectedSize := uint64(0)
 
-	keysCh := make(chan sessioniface.AddRemoveCid)
+	keysCh := make(chan AddRemoveCid)
 	receivedBlockCh, err := lsys.GetBlocksCh(ctx, keysCh)
 	if err != nil {
 		return nil, err

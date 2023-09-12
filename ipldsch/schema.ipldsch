@@ -15,3 +15,10 @@ type Send struct {
 	multihash Bytes
 	resumeFromEntry optional Link
 }
+
+type OutboardMetadata struct {
+    version Int
+    root Link
+    chunkSize Int
+    totalSize Int
+}

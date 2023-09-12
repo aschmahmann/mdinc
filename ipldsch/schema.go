@@ -14,9 +14,10 @@ var embeddedSchema []byte
 var Prototypes schemaSlab
 
 type schemaSlab struct {
-	Message schema.TypedPrototype
-	Entry   schema.TypedPrototype
-	Send    schema.TypedPrototype
+	Message          schema.TypedPrototype
+	Entry            schema.TypedPrototype
+	Send             schema.TypedPrototype
+	OutboardMetadata schema.TypedPrototype
 }
 
 func init() {
@@ -38,5 +39,10 @@ func init() {
 	Prototypes.Send = bindnode.Prototype(
 		(*Send)(nil),
 		ts.TypeByName("Send"),
+	)
+
+	Prototypes.OutboardMetadata = bindnode.Prototype(
+		(*OutboardMetadata)(nil),
+		ts.TypeByName("OutboardMetadata"),
 	)
 }

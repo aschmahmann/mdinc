@@ -2,6 +2,7 @@ package mdinc
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding"
 	"encoding/binary"
@@ -12,7 +13,9 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/ipld/go-car/v2"
 	carbs "github.com/ipld/go-car/v2/blockstore"
+	"github.com/ipld/go-car/v2/storage"
 	"github.com/ipld/go-ipld-prime"
+	"github.com/ipld/go-ipld-prime/codec/dagcbor"
 	_ "github.com/ipld/go-ipld-prime/codec/dagcbor"
 	"github.com/ipld/go-ipld-prime/datamodel"
 	"github.com/ipld/go-ipld-prime/linking"
@@ -24,6 +27,319 @@ import (
 
 	"github.com/aschmahmann/mdinc/ipldsch"
 )
+
+/*
+Outboard
+Combined
+*/
+
+/*
+Outboard Spec1:
+- CBOR object with:
+  - version
+  - root CID (optional)
+  - inner block size
+  - total block size
+- Repeated:
+  - IV
+  - Note: IV isn't enough because it's impossible to know if the outboard is a lie or the data is and they may come from decoupled sources
+  - Multihash
+
+Outboard DAG Spec:
+- CBOR object with:
+  - version
+  - root CID
+*/
+
+/*
+Scenarios:
+1. Outboard known/trusted by user (i.e. .torrent files)
+  - Only IVs needed
+2. Outboard coupled with file (e.g. advertised together in IPNI)
+  - Only IVs needed, since if it doesn't work find a new outboard + file to continue from
+3. Outboards untrusted and files decoupled
+4. Untrusted combined
+  - If we insist IV spacing is fixed at X we should be able to easily resume from one to another
+  - Side note: fully combined doesn't allow for parallel downloads... but do we care here?
+*/
+
+// CreateOutboard2 is a CAR file of CreateDAG with the file blocks stripped out and written as a CARv1
+func CreateOutboard2(ctx context.Context, hashcode multicodec.Code, output io.Writer, input io.Reader, inputSize int64) (multihash.Multihash, error) {
+	// TODO: We should be able to preallocate the file size and use WriterAt to write the file backwards instead of
+	// creating the file in memory and the reversing it
+
+	lsys := cidlink.DefaultLinkSystem()
+	var blockList []blocks.Block
+
+	lsys.StorageWriteOpener = func(context linking.LinkContext) (io.Writer, linking.BlockWriteCommitter, error) {
+		buf := bytes.NewBuffer(nil)
+		return buf, func(l ipld.Link) error {
+			cl, ok := l.(cidlink.Link)
+			if !ok {
+				return fmt.Errorf("not a cidlink")
+			}
+
+			blk, err := blocks.NewBlockWithCid(buf.Bytes(), cl.Cid)
+			if err != nil {
+				return err
+			}
+
+			blockList = append(blockList, blk)
+			return nil
+		}, nil
+	}
+
+	dagRoot, largeBlockHash, err := CreateDAG2(hashcode, input, &lsys, false)
+	if err != nil {
+		return nil, err
+	}
+
+	wc, err := storage.NewWritable(output, []cid.Cid{dagRoot.(cidlink.Link).Cid}, car.WriteAsCarV1(true))
+	if err != nil {
+		return nil, err
+	}
+
+	for i := len(blockList) - 1; i >= 0; i-- {
+		blk := blockList[i]
+		if err := wc.Put(ctx, blk.Cid().KeyString(), blk.RawData()); err != nil {
+			return nil, err
+		}
+	}
+
+	return largeBlockHash, nil
+}
+
+func CreateOutboard(hashcode multicodec.Code, output io.WriterAt, input io.Reader, inputSize int64) (multihash.Multihash, error) {
+	if hashcode != multicodec.Sha2_256 {
+		return nil, fmt.Errorf("only SHA2_256 is supported")
+	}
+
+	// Compute metadata size
+	blankMh, err := multihash.Sum(nil, uint64(hashcode), -1)
+	if err != nil {
+		return nil, fmt.Errorf("could not create placeholder multihash %w", err)
+	}
+
+	md := ipldsch.OutboardMetadata{
+		Version:   1,
+		Root:      cid.NewCidV1(cid.Raw, blankMh),
+		ChunkSize: uint(BlockSize),
+		TotalSize: uint64(inputSize),
+	}
+	be := bindnode.Wrap(&md, ipldsch.Prototypes.Message.Type()).Representation()
+	var metadataBuf bytes.Buffer
+	if err := dagcbor.Encode(be, &metadataBuf); err != nil {
+		return nil, err
+	}
+	metadataSize := int64(metadataBuf.Len())
+
+	const ivSize = 32
+	mhSize := int64(len(blankMh))
+	entrySize := ivSize + mhSize
+
+	numChunks := inputSize / int64(BlockSize)
+	if numChunks*int64(BlockSize) != inputSize {
+		numChunks++
+	}
+	totalSize := metadataSize + numChunks*entrySize
+
+	// Write all of the IVs backwards so that the last IV is at the beginning
+	numIVsWritten := int64(0)
+	inputMh, err := fixedMdChunker(hashcode, input, func(iv, chunk []byte) error {
+		numIVsWritten++
+		offset := totalSize - entrySize*numIVsWritten
+		if _, err := output.WriteAt(iv, offset); err != nil {
+			return err
+		}
+
+		chunkMh, err := multihash.Sum(chunk, uint64(hashcode), -1)
+		if err != nil {
+			return err
+		}
+
+		if _, err := output.WriteAt(chunkMh, offset); err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Now that we know the final hash, write the metadata
+	md.Root = cid.NewCidV1(cid.Raw, inputMh)
+	be = bindnode.Wrap(md, ipldsch.Prototypes.Message.Type()).Representation()
+	metadataBuf.Reset()
+	if err := dagcbor.Encode(be, &metadataBuf); err != nil {
+		return nil, err
+	}
+	if _, err := output.WriteAt(metadataBuf.Bytes(), 0); err != nil {
+		return nil, err
+	}
+
+	return inputMh, nil
+}
+
+func CreateCombined(hashcode multicodec.Code, output io.WriterAt, input io.Reader, inputSize int64) (multihash.Multihash, error) {
+	// Compute metadata size
+	blankMh, err := multihash.Sum(nil, uint64(hashcode), -1)
+	if err != nil {
+		return nil, fmt.Errorf("could not create placeholder multihash %w", err)
+	}
+
+	md := ipldsch.OutboardMetadata{
+		Version:   1,
+		Root:      cid.NewCidV1(cid.Raw, blankMh),
+		ChunkSize: uint(BlockSize),
+		TotalSize: uint64(inputSize),
+	}
+	be := bindnode.Wrap(&md, ipldsch.Prototypes.Message.Type()).Representation()
+	var metadataBuf bytes.Buffer
+	if err := dagcbor.Encode(be, &metadataBuf); err != nil {
+		return nil, err
+	}
+	metadataSize := int64(metadataBuf.Len())
+
+	const ivSize = 32
+	numChunks := inputSize / int64(BlockSize)
+	if numChunks*int64(BlockSize) != inputSize {
+		numChunks++
+	}
+	totalSize := metadataSize + numChunks*ivSize
+
+	// Write all of the IVs backwards so that the last IV is at the beginning
+	numIVsWritten := 0
+	inputMh, err := fixedMdChunker(hashcode, input, func(iv, chunk []byte) error {
+		numIVsWritten++
+		offset := totalSize - int64(ivSize*numIVsWritten)
+		if _, err := output.WriteAt(iv, offset); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Now that we know the final hash, write the metadata
+	md.Root = cid.NewCidV1(cid.Raw, inputMh)
+	be = bindnode.Wrap(md, ipldsch.Prototypes.Message.Type()).Representation()
+	metadataBuf.Reset()
+	if err := dagcbor.Encode(be, &metadataBuf); err != nil {
+		return nil, err
+	}
+	if _, err := output.WriteAt(metadataBuf.Bytes(), 0); err != nil {
+		return nil, err
+	}
+
+	return inputMh, nil
+}
+
+func CreateDAG(hashcode multicodec.Code, input io.Reader, lsys *linking.LinkSystem) (ipld.Link, multihash.Multihash, error) {
+	return CreateDAG2(hashcode, input, lsys, true)
+}
+
+func CreateDAG2(hashcode multicodec.Code, input io.Reader, lsys *linking.LinkSystem, storeLeafBlocks bool) (ipld.Link, multihash.Multihash, error) {
+	processedLen := uint64(0)
+	var msgEntries []ipldsch.Entry
+	var nextLink ipld.Link
+
+	inputMh, err := fixedMdChunker(hashcode, input, func(iv, chunk []byte) error {
+		var dataLink datamodel.Link
+		var err error
+		if storeLeafBlocks {
+			dataLink, err = lsys.Store(ipld.LinkContext{}, cidlink.LinkPrototype{Prefix: intermediateBlockCreator}, basicnode.NewBytes(chunk))
+			if err != nil {
+				return err
+			}
+		} else {
+			c, err := cidlink.LinkPrototype{Prefix: intermediateBlockCreator}.Sum(chunk)
+			if err != nil {
+				return err
+			}
+			dataLink = cidlink.Link{Cid: c}
+		}
+
+		n := len(chunk)
+		entry, err := createEntry(dataLink, n, iv, processedLen)
+		if err != nil {
+			return err
+		}
+		if len(msgEntries) < NumEntriesPerMsg {
+			msgEntries = append(msgEntries, entry)
+		} else {
+			l, err := createMessage(*lsys, msgEntries, nextLink)
+			if err != nil {
+				return err
+			}
+			nextLink = l
+			msgEntries = append([]ipldsch.Entry{}, entry)
+		}
+		processedLen += uint64(n)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if len(msgEntries) > 0 {
+		l, err := createMessage(*lsys, msgEntries, nextLink)
+		if err != nil {
+			return nil, nil, err
+		}
+		nextLink = l
+	}
+
+	return nextLink, inputMh, nil
+}
+
+func fixedMdChunker(hashcode multicodec.Code, input io.Reader, output func(iv, chunk []byte) error) (multihash.Multihash, error) {
+	switch hashcode {
+	case multicodec.Sha2_256:
+	default:
+		return nil, fmt.Errorf("hashcode not supported %v", hashcode)
+	}
+
+	buf := make([]byte, BlockSize)
+	var err error
+	hasher := sha256.New()
+	hashmarshaller := hasher.(encoding.BinaryMarshaler)
+	var nextIV []byte
+
+	for {
+		n, err := input.Read(buf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+
+		if nextIV == nil {
+			nextIV = GetSHA256InitialIV()
+		} else {
+			hashbytes, err := hashmarshaller.MarshalBinary()
+			if err != nil {
+				return nil, err
+			}
+			nextIV = GetSHA256IVFromMarshalledOutput(hashbytes)
+		}
+		hasher.Write(buf[:n])
+
+		if err := output(nextIV, buf); err != nil {
+			return nil, err
+		}
+	}
+
+	digest := hasher.Sum(nil)
+	finalMH, err := multihash.Encode(digest, uint64(multicodec.Sha2_256))
+	if err != nil {
+		return nil, err
+	}
+
+	return finalMH, nil
+}
 
 var BlockSize = 1 << 20 // 1 MiB
 var NumEntriesPerMsg = 8192
@@ -57,7 +373,7 @@ func OutputFile(outputPath string, input io.Reader, withRoot bool, asCarv1 bool)
 		return w, comm, nil
 	}
 
-	root, filehash, err := ingest(multicodec.Sha2_256, input, lsys)
+	root, filehash, err := CreateDAG(multicodec.Sha2_256, input, &lsys)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -74,81 +390,6 @@ func OutputFile(outputPath string, input io.Reader, withRoot bool, asCarv1 bool)
 	}
 
 	return filehash, root, nil
-}
-
-func ingest(hashcode multicodec.Code, reader io.Reader, lsys ipld.LinkSystem) (ipld.Link, multihash.Multihash, error) {
-	switch hashcode {
-	case multicodec.Sha2_256:
-	default:
-		return nil, nil, fmt.Errorf("hashcode not supported %v", hashcode)
-	}
-
-	buf := make([]byte, BlockSize)
-	var err error
-	hasher := sha256.New()
-	hashmarshaller := hasher.(encoding.BinaryMarshaler)
-	var nextIV []byte
-	var processedLen uint64
-	var nextLink ipld.Link
-	var msgEntries []ipldsch.Entry
-
-	for {
-		n, err := reader.Read(buf)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, nil, err
-		}
-
-		if nextIV == nil {
-			nextIV = GetSHA256InitialIV()
-		} else {
-			hashbytes, err := hashmarshaller.MarshalBinary()
-			if err != nil {
-				return nil, nil, err
-			}
-			nextIV = GetSHA256IVFromMarshalledOutput(hashbytes)
-		}
-		hasher.Write(buf[:n])
-
-		dataLink, err := lsys.Store(ipld.LinkContext{}, cidlink.LinkPrototype{Prefix: intermediateBlockCreator}, basicnode.NewBytes(buf))
-		if err != nil {
-			return nil, nil, err
-		}
-
-		entry, err := createEntry(dataLink, n, nextIV, processedLen)
-		if err != nil {
-			return nil, nil, err
-		}
-		if len(msgEntries) < NumEntriesPerMsg {
-			msgEntries = append(msgEntries, entry)
-		} else {
-			l, err := createMessage(lsys, msgEntries, nextLink)
-			if err != nil {
-				return nil, nil, err
-			}
-			nextLink = l
-			msgEntries = append([]ipldsch.Entry{}, entry)
-		}
-		processedLen += uint64(n)
-	}
-
-	if len(msgEntries) > 0 {
-		l, err := createMessage(lsys, msgEntries, nextLink)
-		if err != nil {
-			return nil, nil, err
-		}
-		nextLink = l
-	}
-
-	digest := hasher.Sum(nil)
-	finalMH, err := multihash.Encode(digest, uint64(multicodec.Sha2_256))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	return nextLink, finalMH, nil
 }
 
 var intermediateBlockCreator = cid.Prefix{
